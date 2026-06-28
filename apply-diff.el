@@ -2,10 +2,10 @@
 
 ;; Copyright (C) 2026 Caleb L. Power
 
-;; Author: Your Name <you@example.com>
-;; Maintainer: Your Name <you@example.com>
-;; URL: https://github.com/yourname/apply-diff
-;; Version: 0.1.0
+;; Author: Caleb L. Power <cpower@axonibyte.com>
+;; Maintainer: Caleb L. Power <cpower@axonibyte.com>
+;; URL: https://github.com/calebpower/apply-diff.el
+;; Version: 0.1.1
 ;; Package-Requires: ((emacs "26.1"))
 ;; Keywords: convenience, tools, files
 
@@ -41,11 +41,15 @@
 ;;     the text you want instead
 ;;     >>>>
 ;;
-;; Marker length is variable (>= 4) but must be consistent across all three
+;; Marker length is variable (>= 3) but must be consistent across all three
 ;; runs; either chevron may open as long as the closer is the opposite one;
 ;; and any text on a marker line before/after the run is ignored.  An empty
 ;; old side inserts NEW at the top of the file, an empty new side deletes OLD,
 ;; and an empty block is a no-op.
+;;
+;; If OLD is not found verbatim, apply-diff retries with a uniform indentation
+;; shift (up to 12 spaces either way) and applies the same shift to NEW, so a
+;; diff whose indentation is off by a few spaces still lands.
 ;;
 ;; Call `M-x apply-diff' and choose the buffer to patch (the source of the
 ;; block is the current buffer; the two must differ).  With no region it acts
@@ -57,7 +61,7 @@
 
 ;;; Code:
 
-(defconst apply-diff--chevron-re "\\(<\\{4,\\}\\|>\\{4,\\}\\)"
+(defconst apply-diff--chevron-re "\\(<\\{3,\\}\\|>\\{3,\\}\\)"
   "Matches a run of at least three identical chevrons.")
 
 (defun apply-diff--chomp (s)
@@ -87,7 +91,7 @@ other openers.  Return (:status ok :old O :new N :n N :start S :end E) or
            (n          (length run))
            (open-char  (aref run 0))
            (close-char (if (eq open-char ?<) ?> ?<))
-           (close-re   (if (eq close-char ?<) "<\\{4,\\}" ">\\{4,\\}"))
+           (close-re   (if (eq close-char ?<) "<\\{3,\\}" ">\\{3,\\}"))
            (open-bol   (plist-get opener :bol))
            (open-eol   (plist-get opener :eol))
            (after-open (1+ open-eol))
@@ -95,7 +99,7 @@ other openers.  Return (:status ok :old O :new N :n N :start S :end E) or
            (close-bol nil) (close-eol nil))
       (goto-char open-eol)
       (while (and (not sep-bol)
-                  (re-search-forward "=\\{4,\\}" limit t))
+                  (re-search-forward "=\\{3,\\}" limit t))
         (when (= (length (match-string 0)) n)
           (setq sep-bol (line-beginning-position)
                 sep-eol (line-end-position))))
@@ -165,29 +169,92 @@ Used to detect a region that begins partway through a block."
          hit))
      (apply-diff--scan (line-beginning-position) (point-max)))))
 
-(defun apply-diff--replace-in (tbuf old new deletionp)
-  "In TBUF, replace the first occurrence of OLD with NEW.
-When DELETIONP, also remove a now-empty line.  Warn if OLD occurs >1 times."
+(defconst apply-diff--max-indent-shift 12
+  "Maximum spaces apply-diff adds/removes when recovering from a mismatch.")
+
+(defun apply-diff--shift-text (text delta &optional clamp)
+  "Return TEXT with each non-blank line's leading indentation shifted DELTA spaces.
+Blank lines (whitespace only) are left untouched.  With a negative DELTA: if
+CLAMP is nil, return nil when any non-blank line has fewer than (abs DELTA)
+leading spaces; if CLAMP is non-nil, remove as many leading spaces as are
+available per line (never failing)."
+  (if (zerop delta)
+      text
+    (let ((ok t)
+          (n (abs delta)))
+      (let ((shifted
+             (mapcar
+              (lambda (line)
+                (cond
+                 ((string-match-p "\\`[ \t]*\\'" line) line)
+                 ((> delta 0)
+                  (concat (make-string delta ?\s) line))
+                 (t
+                  (let ((lead (if (string-match "\\`\\( *\\)" line)
+                                  (length (match-string 1 line))
+                                0)))
+                    (cond
+                     ((>= lead n) (substring line n))
+                     (clamp       (substring line lead))
+                     (t           (setq ok nil) line))))))
+              (split-string text "\n"))))
+        (when ok (mapconcat #'identity shifted "\n"))))))
+
+(defun apply-diff--find-match (tbuf old new)
+  "Locate OLD in TBUF, allowing a uniform indentation shift.
+Try shift deltas in the order 0, -1 .. -N, +1 .. +N where N is
+`apply-diff--max-indent-shift'.  Return (:search S :replace R :delta D) for the
+first delta whose shifted OLD is present in TBUF -- S is that exact string and R
+is NEW shifted by the same delta -- or nil if none match."
   (with-current-buffer tbuf
     (save-excursion
-      (goto-char (point-min))
-      (if (not (search-forward old nil t))
-          (error "Could not find the exact text in %s to replace.  Did the file change?"
-                 (buffer-name tbuf))
-        (replace-match new t t)
-        (when (and deletionp (bolp) (looking-at "\n"))
-          (delete-char 1))
-        (let ((extra (save-excursion
-                       (let ((c 0))
-                         (while (search-forward old nil t) (setq c (1+ c)))
-                         c))))
-          (if (> extra 0)
-              (message "apply-diff: %s in %s (warning: %d more occurrence(s) left unchanged)"
-                       (if deletionp "deleted text" "applied change")
-                       (buffer-name tbuf) extra)
-            (message "apply-diff: %s in %s"
-                     (if deletionp "deleted text" "applied change")
-                     (buffer-name tbuf))))))))
+      (catch 'hit
+        (dolist (d (cons 0 (append
+                            (number-sequence -1 (- apply-diff--max-indent-shift) -1)
+                            (number-sequence 1 apply-diff--max-indent-shift)))
+                   nil)
+          (let ((sold (apply-diff--shift-text old d)))
+            (when sold
+              (goto-char (point-min))
+              (when (search-forward sold nil t)
+                (throw 'hit (list :search  sold
+                                  :replace (apply-diff--shift-text new d t)
+                                  :delta   d))))))))))
+
+(defun apply-diff--replace-in (tbuf old new deletionp)
+  "In TBUF, replace the first occurrence of OLD with NEW.
+If OLD is not present verbatim, retry with a uniform indentation shift of up to
+`apply-diff--max-indent-shift' spaces in either direction, applying the same
+shift to NEW.  When DELETIONP, also remove a now-empty line.  Warn if the
+matched text occurs more than once."
+  (let ((m (apply-diff--find-match tbuf old new)))
+    (unless m
+      (error "Could not find the exact text in %s to replace.  Did the file change?"
+             (buffer-name tbuf)))
+    (let ((search  (plist-get m :search))
+          (replace (plist-get m :replace))
+          (delta   (plist-get m :delta)))
+      (with-current-buffer tbuf
+        (save-excursion
+          (goto-char (point-min))
+          (search-forward search nil t)
+          (replace-match replace t t)
+          (when (and deletionp (bolp) (looking-at "\n"))
+            (delete-char 1))
+          (let* ((extra (save-excursion
+                          (let ((c 0))
+                            (while (search-forward search nil t) (setq c (1+ c)))
+                            c)))
+                 (verb (if deletionp "deleted text" "applied change"))
+                 (idnt (if (zerop delta)
+                           ""
+                         (format " (re-indented by %+d spaces)" delta)))
+                 (warn (if (> extra 0)
+                           (format " (warning: %d more occurrence(s) left unchanged)"
+                                   extra)
+                         "")))
+            (message "apply-diff: %s in %s%s%s"
+                     verb (buffer-name tbuf) idnt warn)))))))
 
 (defun apply-diff--apply (old new tbuf)
   "Apply OLD/NEW to TBUF following the empty-side conventions."
